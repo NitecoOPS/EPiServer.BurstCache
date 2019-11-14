@@ -1,8 +1,9 @@
 ﻿using EPiServer.Configuration;
 using EPiServer.Core;
+using EPiServer.ServiceLocation;
+using EPiServer.Web;
 using System;
 using System.Security.Principal;
-using System.Threading;
 using System.Web;
 
 namespace EPiServer.BurstCache
@@ -14,29 +15,12 @@ namespace EPiServer.BurstCache
     /// To use this one in WebForms, override PageBase's SetCachePolicy to call this one's SetCachePolicy instead of
     /// OutputCacheHandler's.
     /// </remarks>
-    public class BurstOutputCacheHandler
+    public partial class BurstOutputCacheHandler
     {
-        /// <summary>
-        /// Stores state to be passed to the Output Cache Validation Callback.
-        /// You pass it to
-        /// <see cref="HttpCachePolicyBase.AddValidationCallback(HttpCacheValidateHandler, object)"/> when you register
-        /// <see cref="ValidateOutputCache(HttpContext, object, ref HttpValidationStatus)"/>.
-        /// </summary>
-        public class State
-        {
-            public readonly long VersionInCache;
-            public long VersionRendering;
-            public Settings Config { get; private set; }
-            public DateTime RefreshAfter { get; private set; }
 
-            public State(Settings settings, long currentVersion, DateTime refreshAfter)
-            {
-                Config = settings;
-                VersionInCache = currentVersion;
-                RefreshAfter = refreshAfter;
-                VersionRendering = -1;
-            }
-        }
+        public static Injected<IContentCacheVersion> ContentCacheVersion { get; set; }
+
+        public static Injected<IAccessDeniedHandler> AccessDeniedHandler { get; set; }
 
         /// <summary>
         /// Sets the cache policy for this request based on parameters as current user and parameters.
@@ -64,13 +48,16 @@ namespace EPiServer.BurstCache
         /// </remarks>
         public virtual void SetCachePolicy(IPrincipal currentPrincipal, ContentReference currentContent, HttpContextBase httpContext, Settings configurationSettings, DateTime? contentExpiration, TimeSpan refresh)
         {
+            if (configurationSettings == null || currentContent == null || httpContext == null)
+                throw new NotSupportedException();
+
             if (UseOutputCache(currentPrincipal, httpContext, configurationSettings.HttpCacheExpiration) && currentContent.WorkID <= 0)
             {
-                string cacheVaryByCustom = EPiServer.Configuration.Settings.Instance.HttpCacheVaryByCustom;
+                string cacheVaryByCustom = Settings.Instance.HttpCacheVaryByCustom;
 
                 httpContext.Response.Cache.SetVaryByCustom(cacheVaryByCustom);
 
-                string[] cacheVaryByParams = EPiServer.Configuration.Settings.Instance.HttpCacheVaryByParams;
+                string[] cacheVaryByParams = Settings.Instance.HttpCacheVaryByParams;
                 foreach (string varyBy in cacheVaryByParams)
                 {
                     httpContext.Response.Cache.VaryByParams[varyBy] = true;
@@ -79,13 +66,13 @@ namespace EPiServer.BurstCache
                 httpContext.Response.Cache.SetValidUntilExpires(true);
 
                 DateTime cacheExpiration = DateTime.Now + configurationSettings.HttpCacheExpiration;
-                DateTime stopPublish = contentExpiration.HasValue ? contentExpiration.Value : DateTime.MaxValue;
+                DateTime stopPublish = contentExpiration ?? DateTime.MaxValue;
                 DateTime expiresAt = cacheExpiration < stopPublish ? cacheExpiration : stopPublish;
 
-                var state = new State(configurationSettings, DataFactoryCache.Version, expiresAt.Subtract(refresh));
+                var state = new State(configurationSettings, ContentCacheVersion.Service.Version, expiresAt.Subtract(refresh));
                 httpContext.Response.Cache.AddValidationCallback(new HttpCacheValidateHandler(ValidateOutputCache), state);
                 httpContext.Response.Cache.SetExpires(expiresAt);
-                httpContext.Response.Cache.SetCacheability(EPiServer.Configuration.Settings.Instance.HttpCacheability);
+                httpContext.Response.Cache.SetCacheability(Settings.Instance.HttpCacheability);
             }
             else
             {
@@ -105,9 +92,12 @@ namespace EPiServer.BurstCache
         /// <returns></returns>
         public static bool UseOutputCache(IPrincipal principal, HttpContextBase context, TimeSpan duration)
         {
+            if (principal == null || context == null)
+                throw new NotSupportedException();
+
             return !principal.Identity.IsAuthenticated
                 && duration != TimeSpan.Zero
-                && String.Equals(context.Request.HttpMethod, "GET", StringComparison.OrdinalIgnoreCase);
+                && string.Equals(context.Request.HttpMethod, "GET", StringComparison.OrdinalIgnoreCase);
         }
 
         /// <summary>
@@ -118,12 +108,16 @@ namespace EPiServer.BurstCache
         /// <param name="validationStatus">The validation status.</param>
         public static void ValidateOutputCache(HttpContext context, object data, ref HttpValidationStatus validationStatus)
         {
+            if (context == null) throw new NotSupportedException();
+
             HttpContextWrapper httpContext = new HttpContextWrapper(context);
             KeepUserLoggedOn(httpContext);
             var state = (State)data;
+            if (state == null) throw new NotSupportedException();
+
             if (UseOutputCache(context.User, httpContext, state.Config.HttpCacheExpiration))
             {
-                var currentVersion = DataFactoryCache.Version;
+                var currentVersion = ContentCacheVersion.Service.Version;
 
                 if ((state.VersionInCache == currentVersion) && (state.RefreshAfter > DateTime.Now))
                 {
@@ -131,7 +125,7 @@ namespace EPiServer.BurstCache
                     return;
                 }
 
-                if (Interlocked.Exchange(ref state.VersionRendering, currentVersion) == currentVersion)
+                if (state.ExchangeVersion(currentVersion))
                 {
                     // Someone else have already received "IgnoreThisRequest" from this method for this state object.
                     // This time, serve a cached (though stale) response again.
@@ -147,19 +141,21 @@ namespace EPiServer.BurstCache
         /// </summary>
         private static void KeepUserLoggedOn(HttpContextBase httpContext)
         {
-            if (!EPiServer.Security.FormsSettings.IsFormsAuthentication && EPiServer.Configuration.Settings.Instance.UIKeepUserLoggedOn)
+            if (!Security.FormsSettings.IsFormsAuthentication && Settings.Instance.UIKeepUserLoggedOn)
             {
                 if (HttpContext.Current.Request.Cookies["KeepLoggedOnUser"] != null)
                 {
                     if (!httpContext.User.Identity.IsAuthenticated)
                     {
-                        DefaultAccessDeniedHandler.CreateAccessDeniedDelegate()(null);
+                        AccessDeniedHandler.Service.AccessDenied(null);
                     }
                 }
                 else if (httpContext.User.Identity.IsAuthenticated)
                 {
-                    HttpCookie keepLoggedOn = new HttpCookie("KeepLoggedOnUser", "True");
-                    keepLoggedOn.Path = HttpContext.Current.Request.ApplicationPath;
+                    HttpCookie keepLoggedOn = new HttpCookie("KeepLoggedOnUser", "True")
+                    {
+                        Path = HttpContext.Current.Request.ApplicationPath
+                    };
                     HttpContext.Current.Response.Cookies.Add(keepLoggedOn);
                 }
             }

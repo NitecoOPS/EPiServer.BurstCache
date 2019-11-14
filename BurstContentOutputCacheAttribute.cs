@@ -1,12 +1,8 @@
-﻿using EPiServer;
-using EPiServer.Configuration;
+﻿using EPiServer.Configuration;
 using EPiServer.Core;
 using EPiServer.ServiceLocation;
-using EPiServer.Web;
 using EPiServer.Web.Routing;
 using System;
-using System.Collections.Generic;
-using System.Linq;
 using System.Security.Principal;
 using System.Web;
 using System.Web.Mvc;
@@ -70,6 +66,8 @@ namespace EPiServer.BurstCache
         /// <value>The content loader.</value>
         public Injected<IContentLoader> ContentLoader { get; set; }
 
+        public Injected<IContentCacheVersion> ContentCacheVersion { get; set; }
+
         /// <summary>
         /// Gets or sets a value indicating whether this <see cref="BurstContentOutputCacheAttribute"/> is disabled.
         /// </summary>
@@ -102,26 +100,27 @@ namespace EPiServer.BurstCache
         public virtual Func<IPrincipal, HttpContextBase, TimeSpan, bool> UseOutputCacheValidator { get; set; }
 
         /// <summary>
-        /// This method is an implementation of <see cref="M:System.Web.Mvc.IActionFilter.OnActionExecuting(System.Web.Mvc.ActionExecutingContext)"/> and supports the ASP.NET MVC infrastructure. It is not intended to be used directly from your code.
+        /// This method is an implementation of <see cref="IActionFilter.OnActionExecuting(ActionExecutingContext)"/> and supports the ASP.NET MVC infrastructure. It is not intended to be used directly from your code.
         /// </summary>
         /// <param name="filterContext">The filter context.</param>
         public override void OnActionExecuting(ActionExecutingContext filterContext)
         {
-            if (filterContext.IsChildAction)
+            if (filterContext == null || filterContext.IsChildAction)
             {
-                throw new NotSupportedException("BurstContentOutputCacheAttribute should not be used on child actions.");
+                throw new NotSupportedException();
             }
+
             base.OnActionExecuting(filterContext);
         }
 
         /// <summary>
         /// Called before the action result executes.
         /// </summary>
-        /// <param name="filterContext">The filter context, which encapsulates information for using <see cref="T:System.Web.Mvc.AuthorizeAttribute"/>.</param>
-        /// <exception cref="T:System.ArgumentNullException">The <paramref name="filterContext"/> parameter is null.</exception>
+        /// <param name="filterContext">The filter context, which encapsulates information for using <see cref="AuthorizeAttribute"/>.</param>
+        /// <exception cref="ArgumentNullException">The <paramref name="filterContext"/> parameter is null.</exception>
         public override void OnResultExecuting(ResultExecutingContext filterContext)
         {
-            if (Disable)
+            if (filterContext == null || Disable)
             {
                 return;
             }
@@ -133,7 +132,7 @@ namespace EPiServer.BurstCache
                 {
                     Duration = Convert.ToInt32(ConfigurationSettings.Service.HttpCacheExpiration.TotalSeconds);
                 }
-                if (String.IsNullOrEmpty(VaryByCustom))
+                if (string.IsNullOrEmpty(VaryByCustom))
                 {
                     VaryByCustom = ConfigurationSettings.Service.HttpCacheVaryByCustom;
                 }
@@ -145,8 +144,7 @@ namespace EPiServer.BurstCache
             {
                 DateTime now = DateTime.Now;
 
-                IVersionable versionable = ContentLoader.Service.Get<IContent>(contentLink) as IVersionable;
-                if (versionable != null && versionable.StopPublish.HasValue)
+                if (ContentLoader.Service.Get<IContent>(contentLink) is IVersionable versionable && versionable.StopPublish.HasValue)
                 {
                     if (versionable.StopPublish < now)
                     {
@@ -166,16 +164,16 @@ namespace EPiServer.BurstCache
                 {
                     base.OnResultExecuting(filterContext);
                     filterContext.HttpContext.Response.Cache.AddValidationCallback(new HttpCacheValidateHandler(BurstOutputCacheHandler.ValidateOutputCache),
-                        new BurstOutputCacheHandler.State(
+                        new State(
                             ConfigurationSettings.Service,
-                            DataFactoryCache.Version,
+                            ContentCacheVersion.Service.Version,
                             now + refresh));
                 }
             }
         }
 
-        
 
-        
+
+
     }
 }
